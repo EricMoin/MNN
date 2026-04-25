@@ -58,7 +58,7 @@ class Talker : public Llm {
 public:
     Talker(std::shared_ptr<LlmConfig> config) : Llm(config), mThinker(nullptr) {}
     Talker(std::shared_ptr<LlmConfig> config, Llm* thinker) : Llm(config), mThinker(thinker) {}
-    ~Talker() {}
+    ~Talker();
     virtual bool load() override;
     virtual void generate_init(std::ostream* os = nullptr, const char* end_with = nullptr) override;
     virtual Express::VARP embedding(const std::vector<int>& input_ids) override;

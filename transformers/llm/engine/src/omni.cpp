@@ -29,6 +29,60 @@
 #ifdef LLM_SUPPORT_AUDIO
 #include <audio/audio.hpp>
 #endif
+#ifdef ENABLE_PERF_LOGGING
+#include <chrono>
+#include <unistd.h>
+#include <cstdarg>
+#include <mutex>
+
+static FILE* gPerfLogFile = nullptr;
+static std::mutex gPerfLogMutex;
+static std::atomic<int> gPerfChunkId{0};
+static std::atomic<int64_t> gPerfTotalDitUs{0};
+static std::atomic<int64_t> gPerfTotalVocoderUs{0};
+static std::atomic<int64_t> gPerfTotalChunks{0};
+
+static void perf_write(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(gPerfLogMutex);
+    if (!gPerfLogFile) return;
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(gPerfLogFile, fmt, args);
+    va_end(args);
+    fflush(gPerfLogFile);
+}
+
+static void perf_open() {
+    if (gPerfLogFile) return;
+    gPerfLogFile = fopen("perf_log.txt", "w");
+}
+
+static void perf_close() {
+    if (gPerfLogFile) {
+        fclose(gPerfLogFile);
+        gPerfLogFile = nullptr;
+    }
+}
+
+static size_t getCurrentRSS() {
+    size_t rss = 0;
+    FILE* fp = fopen("/proc/self/statm", "r");
+    if (fp) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        long pages = 0;
+        if (fscanf(fp, "%*s%ld", &pages) == 1) {
+            rss = (size_t)pages * (size_t)page_size / 1024;
+        }
+        fclose(fp);
+    }
+    return rss;
+}
+
+#define PERF_PRINT(fmt, ...) perf_write("[PERF] " fmt "\n", ##__VA_ARGS__)
+#else
+#define PERF_PRINT(fmt, ...) ((void)0)
+#endif
+
 namespace MNN {
 using namespace Express;
 namespace Transformer {
@@ -1133,7 +1187,23 @@ bool Talker::load() {
     if (mBigvgan.get() == nullptr || mPreDit.get() == nullptr || mDit.get() == nullptr) {
         return false;
     }
+#ifdef ENABLE_PERF_LOGGING
+    perf_open();
+#endif
     return true;
+}
+
+Talker::~Talker() {
+#ifdef ENABLE_PERF_LOGGING
+    int64_t total_chunks = gPerfTotalChunks.load();
+    int64_t total_dit_us = gPerfTotalDitUs.load();
+    int64_t total_vocoder_us = gPerfTotalVocoderUs.load();
+    double avg_dit_ms = total_chunks > 0 ? (total_dit_us / 1000.0) / total_chunks : 0.0;
+    double avg_vocoder_ms = total_chunks > 0 ? (total_vocoder_us / 1000.0) / total_chunks : 0.0;
+    PERF_PRINT("stage=summary total_chunks=%lld avg_dit_ms=%.3f avg_vocoder_ms=%.3f",
+               (long long)total_chunks, avg_dit_ms, avg_vocoder_ms);
+    perf_close();
+#endif
 }
 
 void Talker::generate_init(std::ostream* os, const char* end_with) {
@@ -1216,6 +1286,9 @@ VARP Talker::ditForward(const int codec_size, const int* codec_tokens, const flo
     }
     MNN::Timer _t;
     for (int i = 0; i < steps - 1; i++) {
+#ifdef ENABLE_PERF_LOGGING
+        auto dit_step_start = std::chrono::high_resolution_clock::now();
+#endif
         float t0 = 1 - std::cos(M_PI / 2 * i * step_ratio);
         float t1 = 1 - std::cos(M_PI / 2 * (i + 1) * step_ratio);
         float dt = t1 - t0;
@@ -1235,6 +1308,11 @@ VARP Talker::ditForward(const int codec_size, const int* codec_tokens, const flo
             auto dy = (kk1 + _Scalar<float>(3.0) * (kk2 + kk3) + kk4) * _Scalar<float>(dt * 0.125);
             y0 = y0 + dy;
         }
+#ifdef ENABLE_PERF_LOGGING
+        auto dit_step_end = std::chrono::high_resolution_clock::now();
+        double step_time_ms = std::chrono::duration<double, std::milli>(dit_step_end - dit_step_start).count();
+        PERF_PRINT("stage=serial phase=dit_step step=%d/%d step_time_ms=%.3f solver=%d", i, steps - 1, step_time_ms, solver);
+#endif
     }
     auto generated_mel = _Permute(y0, {0, 2, 1});
     return generated_mel;
@@ -1248,6 +1326,10 @@ VARP Talker::bigvganForward(VARP mel) {
 
 void Talker::token2wav(bool talker_done) {
     MNN::Express::ExecutorScope s(mExecutor);
+#ifdef ENABLE_PERF_LOGGING
+    int chunk_id = gPerfChunkId.fetch_add(1);
+    auto t_start = std::chrono::high_resolution_clock::now();
+#endif
     int codec_size = mContext->gen_seq_len - dit_start_index;
     int chunk_size = dit_left_padding + dit_chunk_size + dit_right_padding;
     bool last_chunk = talker_done && (codec_size <= chunk_size);
@@ -1262,14 +1344,35 @@ void Talker::token2wav(bool talker_done) {
     auto noise_ptr = mInitialNoise.data() + dit_start_index * 160;
     int real_size = last_chunk ? codec_size : chunk_size;
     int mel_size = last_chunk ? -1 : dit_chunk_size * 2;
-    MNN::Timer _t;
     // dit
+#ifdef ENABLE_PERF_LOGGING
+    auto t_dit_start = std::chrono::high_resolution_clock::now();
+#endif
+    MNN::Timer _t_dit;
     auto generated_mel = ditForward(real_size, codec_ptr, noise_ptr);
     generated_mel = _Slice(generated_mel, _var<int>({0, 0, dit_left_padding * 2}, {3}), _var<int>({-1, -1, mel_size}, {3}));
     mMelBuffer = (mMelBuffer == nullptr) ? generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
+    mContext->vision_us += _t_dit.durationInUs();  // DiT time (reuse vision_us in talker context)
     dit_left_padding = dit_left_context;
     dit_start_index += (chunk_size - dit_left_padding - dit_right_padding);
-    // bigvga
+#ifdef ENABLE_PERF_LOGGING
+    auto t_dit_end = std::chrono::high_resolution_clock::now();
+    double dit_time_ms = std::chrono::duration<double, std::milli>(t_dit_end - t_dit_start).count();
+    {
+        auto mel_info = generated_mel->getInfo();
+        auto& dims = mel_info->dim;
+        PERF_PRINT("stage=serial phase=dit chunk_id=%d dit_time_ms=%.3f codec_size=%d chunk_size_frames=%d context_frames=%d mel_dims=%d,%d,%d,%d",
+                   chunk_id, dit_time_ms, codec_size, chunk_size, dit_left_padding + dit_right_padding,
+                   (int)dims.size() > 0 ? dims[0] : 0, (int)dims.size() > 1 ? dims[1] : 0,
+                   (int)dims.size() > 2 ? dims[2] : 0, (int)dims.size() > 3 ? dims[3] : 0);
+    }
+    gPerfTotalDitUs.fetch_add((int64_t)(_t_dit.durationInUs()));
+#endif
+    // bigvgan
+#ifdef ENABLE_PERF_LOGGING
+    auto t_voc_start = std::chrono::high_resolution_clock::now();
+#endif
+    MNN::Timer _t_voc;
     auto generated_waveform = bigvganForward(mMelBuffer);
     // append waveform to mWaveformBuffer
     auto ptr = generated_waveform->readMap<float>() + vocoder_left_pad * vocoder_upsample_rate;
@@ -1277,11 +1380,38 @@ void Talker::token2wav(bool talker_done) {
     mWaveformBuffer.insert(mWaveformBuffer.end(), ptr, ptr + size);
     vocoder_left_pad = vocoder_left_context;
     mMelBuffer = _Slice(mMelBuffer, _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}), _var<int>({-1, -1, -1}, {3}));
-    mContext->audio_us += _t.durationInUs();
+    mContext->audio_us += _t_voc.durationInUs();
+#ifdef ENABLE_PERF_LOGGING
+    auto t_voc_end = std::chrono::high_resolution_clock::now();
+    double vocoder_time_ms = std::chrono::duration<double, std::milli>(t_voc_end - t_voc_start).count();
+    {
+        auto wf_info = generated_waveform->getInfo();
+        auto& dims = wf_info->dim;
+        PERF_PRINT("stage=serial phase=vocoder chunk_id=%d vocoder_time_ms=%.3f waveform_dims=%d,%d,%d,%d",
+                   chunk_id, vocoder_time_ms,
+                   (int)dims.size() > 0 ? dims[0] : 0, (int)dims.size() > 1 ? dims[1] : 0,
+                   (int)dims.size() > 2 ? dims[2] : 0, (int)dims.size() > 3 ? dims[3] : 0);
+    }
+    gPerfTotalVocoderUs.fetch_add((int64_t)(_t_voc.durationInUs()));
+#endif
     if (mWavformCallback) {
+#ifdef ENABLE_PERF_LOGGING
+        auto t_post_start = std::chrono::high_resolution_clock::now();
+#endif
         bool res = mWavformCallback(ptr, size, last_chunk);
+#ifdef ENABLE_PERF_LOGGING
+        auto t_post_end = std::chrono::high_resolution_clock::now();
+        double post_time_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
+        PERF_PRINT("stage=serial phase=postprocess chunk_id=%d postprocess_time_ms=%.3f", chunk_id, post_time_ms);
+#endif
         if (!res) { return; }
     }
+#ifdef ENABLE_PERF_LOGGING
+    auto t_end = std::chrono::high_resolution_clock::now();
+    double total_time_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    PERF_PRINT("stage=serial phase=chunk_done chunk_id=%d total_time_ms=%.3f last_chunk=%d", chunk_id, total_time_ms, last_chunk ? 1 : 0);
+    gPerfTotalChunks.fetch_add(1);
+#endif
     if (talker_done && !last_chunk) {
         token2wav(true);
     }
@@ -1306,6 +1436,11 @@ int Talker::sample(Express::VARP logits, int offset, int size) {
 void Talker::generate() {
     MNN::Express::ExecutorScope s(mExecutor);
     if (!doGenerate()) { return; }
+#ifdef ENABLE_PERF_LOGGING
+    auto t_gen_start = std::chrono::high_resolution_clock::now();
+    auto ts_ms = std::chrono::duration<double, std::milli>(t_gen_start.time_since_epoch()).count();
+    PERF_PRINT("stage=serial phase=generate_start timestamp_ms=%.3f", ts_ms);
+#endif
     mTalkerEmbeds.push_back(mTextEos);
     auto input_embeds = _Concat({mTalkerEmbeds[0], mTextBos + mCodecPad, mTalkerEmbeds[1] + mCodecBos}, 1);
     // push 2 token ids
@@ -1338,6 +1473,12 @@ void Talker::generate() {
     }
     mContext->decode_us += _t.durationInUs();
     token2wav(true);
+#ifdef ENABLE_PERF_LOGGING
+    auto t_gen_end = std::chrono::high_resolution_clock::now();
+    double total_time_ms = std::chrono::duration<double, std::milli>(t_gen_end - t_gen_start).count();
+    int total_chunks = gPerfTotalChunks.load();
+    PERF_PRINT("stage=serial phase=generate_end total_time_ms=%.3f total_chunks=%d", total_time_ms, total_chunks);
+#endif
 }
 
 void Talker::setPostionIds(const MropeInfo& positionIds) {
