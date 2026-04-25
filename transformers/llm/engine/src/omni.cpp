@@ -1409,7 +1409,9 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
         float thinker_decode_s = mContext->decode_us / 1e6;
         float talker_prefill_s = ctx->prefill_us / 1e6;
         float talker_decode_s = ctx->decode_us / 1e6;
-        float token2wav_s = ctx->audio_us / 1e6;
+        float dit_s = ctx->vision_us / 1e6;            // vision_us repurposed as DiT time in talker context
+        float bigvgan_s = ctx->audio_us / 1e6;         // audio_us = BigVGAN time
+        float token2wav_s = dit_s + bigvgan_s;
         float audio_duration = ctx->gen_seq_len / 50.0;
         printf("\n#################################\n");
         printf(" [interleaved mode]\n");
@@ -1420,6 +1422,8 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
         printf("     talker prefill = %.2f s\n", talker_prefill_s);
         printf("      talker decode = %.2f s\n", talker_decode_s);
         printf("       ttfa (total) = %.2f s\n", ttfa_s);
+        printf("             DiT   = %.2f s\n", dit_s);
+        printf("         BigVGAN   = %.2f s\n", bigvgan_s);
         printf("      token2wav     = %.2f s\n", token2wav_s);
         printf("       tts rtf      = %.2f \n", (talker_decode_s + token2wav_s) / audio_duration);
         printf("##################################\n");
@@ -1460,7 +1464,8 @@ void Omni::generateWavform() {
             float decode_s = context->decode_us / 1e6;
             float ttfa_s = (mThinkerElapsedUs + context->ttfa_us) / 1e6;
             float token2wav_s = context->audio_us / 1e6;
-            float dit_s = context->vision_us / 1e6;
+            float dit_s = context->vision_us / 1e6;     // vision_us repurposed as DiT time in talker context
+            float bigvgan_s = token2wav_s;               // audio_us = BigVGAN only (async) or DiT+BigVGAN (sync)
             float tts_s = token2wav_s;
             if (mTalker->mStreamWithDecode) {
                 tts_s += decode_s;
@@ -1473,6 +1478,7 @@ void Omni::generateWavform() {
             printf("   decode time = %.2f s\n", decode_s);
             printf("      ttfa time = %.2f s\n", ttfa_s);
             printf("      dit time = %.2f s\n", dit_s);
+            printf("  bigvgan time = %.2f s\n", bigvgan_s);
             printf("token2wav time = %.2f s\n", token2wav_s);
             printf("      tts time = %.2f s\n", tts_s);
             printf("  prefill speed = %.2f tok/s\n", context->prompt_len / prefill_s);
@@ -1687,14 +1693,16 @@ void Talker::token2wav(bool talker_done) {
     auto noise_ptr = mInitialNoise.data() + dit_start_index * 160;
     int real_size = last_chunk ? codec_size : chunk_size;
     int mel_size = last_chunk ? -1 : dit_chunk_size * 2;
-    MNN::Timer _t;
     // dit
+    MNN::Timer _t_dit;
     auto generated_mel = ditForward(real_size, codec_ptr, noise_ptr);
     generated_mel = _Slice(generated_mel, _var<int>({0, 0, dit_left_padding * 2}, {3}), _var<int>({-1, -1, mel_size}, {3}));
     mMelBuffer = (mMelBuffer == nullptr) ? generated_mel : _Concat({mMelBuffer, generated_mel}, -1);
+    mContext->vision_us += _t_dit.durationInUs();  // DiT time (reuse vision_us in talker context)
     dit_left_padding = dit_left_context;
     dit_start_index += (chunk_size - dit_left_padding - dit_right_padding);
-    // bigvga
+    // bigvgan
+    MNN::Timer _t_voc;
     auto generated_waveform = bigvganForward(mMelBuffer);
     // append waveform to mWaveformBuffer
     auto ptr = generated_waveform->readMap<float>() + vocoder_left_pad * vocoder_upsample_rate;
@@ -1702,7 +1710,7 @@ void Talker::token2wav(bool talker_done) {
     mWaveformBuffer.insert(mWaveformBuffer.end(), ptr, ptr + size);
     vocoder_left_pad = vocoder_left_context;
     mMelBuffer = _Slice(mMelBuffer, _var<int>({0, 0, -vocoder_left_pad - vocoder_right_pad}, {3}), _var<int>({-1, -1, -1}, {3}));
-    mContext->audio_us += _t.durationInUs();
+    mContext->audio_us += _t_voc.durationInUs();
     if (mWavformCallback) {
         bool res = mWavformCallback(ptr, size, last_chunk);
         if (!res) { return; }

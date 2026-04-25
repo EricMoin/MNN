@@ -12,7 +12,7 @@
 #include <MNN/MNNDefine.h>
 #include "ThreadPool.hpp"
 
-#define MNN_THREAD_POOL_MAX_TASKS 2
+#define MNN_THREAD_POOL_MAX_TASKS 4
 namespace MNN {
 static std::unordered_map<long int, ThreadPool*> gInstances;
 static std::mutex gInitMutex;

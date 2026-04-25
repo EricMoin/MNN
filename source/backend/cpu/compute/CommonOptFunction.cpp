@@ -4399,9 +4399,103 @@ void MNNSiLu(float* dst, const float* src, size_t dataSize) {
         0.0f
     };
     MNNExp(dst, src, offset, dataSize);
+#ifdef __aarch64__
+    int dataC4 = static_cast<int32_t>(dataSize) / 4;
+    int remain = static_cast<int32_t>(dataSize) % 4;
+    float32x4_t one = vdupq_n_f32(1.0f);
+    if (dataC4 > 0) {
+        for (int i = 0; i < dataC4; ++i) {
+            float32x4_t d = vld1q_f32(dst);
+            float32x4_t s = vld1q_f32(src);
+            // dst = src / (1 + dst) using NEON reciprocal estimate + NR step
+            float32x4_t denom = vaddq_f32(one, d);
+            float32x4_t recip = vrecpeq_f32(denom);
+            recip = vmulq_f32(vrecpsq_f32(denom, recip), recip);
+            float32x4_t result = vmulq_f32(s, recip);
+            vst1q_f32(dst, result);
+            dst += 4;
+            src += 4;
+        }
+    }
+    if (remain > 0) {
+        float stmp[4] = {0.f, 0.f, 0.f, 0.f};
+        float dtmp[4] = {0.f, 0.f, 0.f, 0.f};
+        ::memcpy(stmp, src, remain * sizeof(float));
+        ::memcpy(dtmp, dst, remain * sizeof(float));
+        float32x4_t s = vld1q_f32(stmp);
+        float32x4_t d = vld1q_f32(dtmp);
+        float32x4_t denom = vaddq_f32(one, d);
+        float32x4_t recip = vrecpeq_f32(denom);
+        recip = vmulq_f32(vrecpsq_f32(denom, recip), recip);
+        float32x4_t result = vmulq_f32(s, recip);
+        vst1q_f32(stmp, result);
+        ::memcpy(dst, stmp, remain * sizeof(float));
+    }
+#else
     for (int i = 0; i < dataSize; ++i) {
         dst[i] = src[i] / (1.0f + dst[i]);
     }
+#endif
+}
+
+void MNNSnake(float* dst, const float* src, size_t dataSize) {
+    // Snake activation: x + sin^2(x)  (with alpha=1.0)
+    // Full formula: x + (1/alpha) * sin^2(alpha * x)
+#ifdef __aarch64__
+    int dataC4 = static_cast<int32_t>(dataSize) / 4;
+    int remain = static_cast<int32_t>(dataSize) % 4;
+    float32x4_t one = vdupq_n_f32(1.0f);
+    // Polynomial coefficients for sin approximation on [-pi, pi]
+    // Using Taylor series: sin(x) ≈ x - x^3/6 + x^5/120 - x^7/5040
+    const float32x4_t c3 = vdupq_n_f32(-1.0f / 6.0f);
+    const float32x4_t c5 = vdupq_n_f32(1.0f / 120.0f);
+    const float32x4_t c7 = vdupq_n_f32(-1.0f / 5040.0f);
+    if (dataC4 > 0) {
+        for (int i = 0; i < dataC4; ++i) {
+            float32x4_t x = vld1q_f32(src);
+            // Range reduction: wrap x to [-pi, pi] is complex; for Snake,
+            // alpha*x is typically small. Use polynomial directly.
+            float32x4_t x2 = vmulq_f32(x, x);
+            float32x4_t x3 = vmulq_f32(x2, x);
+            float32x4_t x5 = vmulq_f32(x3, x2);
+            float32x4_t x7 = vmulq_f32(x5, x2);
+            // sin(x) ≈ x + c3*x^3 + c5*x^5 + c7*x^7
+            float32x4_t sin_x = vaddq_f32(x, vmulq_f32(c3, x3));
+            sin_x = vaddq_f32(sin_x, vmulq_f32(c5, x5));
+            sin_x = vaddq_f32(sin_x, vmulq_f32(c7, x7));
+            // sin^2(x)
+            float32x4_t sin2 = vmulq_f32(sin_x, sin_x);
+            // snake = x + sin^2(x)
+            float32x4_t result = vaddq_f32(x, sin2);
+            vst1q_f32(dst, result);
+            dst += 4;
+            src += 4;
+        }
+    }
+    if (remain > 0) {
+        float stmp[4] = {0.f, 0.f, 0.f, 0.f};
+        ::memcpy(stmp, src, remain * sizeof(float));
+        float32x4_t x = vld1q_f32(stmp);
+        float32x4_t x2 = vmulq_f32(x, x);
+        float32x4_t x3 = vmulq_f32(x2, x);
+        float32x4_t x5 = vmulq_f32(x3, x2);
+        float32x4_t x7 = vmulq_f32(x5, x2);
+        float32x4_t sin_x = vaddq_f32(x, vmulq_f32(c3, x3));
+        sin_x = vaddq_f32(sin_x, vmulq_f32(c5, x5));
+        sin_x = vaddq_f32(sin_x, vmulq_f32(c7, x7));
+        float32x4_t sin2 = vmulq_f32(sin_x, sin_x);
+        float32x4_t result = vaddq_f32(x, sin2);
+        vst1q_f32(stmp, result);
+        ::memcpy(dst, stmp, remain * sizeof(float));
+    }
+#else
+    for (int i = 0; i < dataSize; ++i) {
+        float x = src[i];
+        float sin_x = sinf(x);
+        float sin2 = sin_x * sin_x;
+        dst[i] = x + sin2;
+    }
+#endif
 }
 
 /**

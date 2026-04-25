@@ -380,6 +380,9 @@ MNNUnaryExecute CPUUnary::selectForFloat(int type, int precision) {
                 return (MNNUnaryExecute)MNNSiLu;
             }
             break;
+        case UnaryOpOperation_SNAKE:
+            return (MNNUnaryExecute)MNNSnake;
+            break;
         case UnaryOpOperation_TANH:
             return (MNNUnaryExecute)MNNTanh;
         case UnaryOpOperation_TAN:

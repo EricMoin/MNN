@@ -118,6 +118,7 @@ void MNNSigmoid(float* dst, const float* src, size_t dataSize);
 void MNNSigmoidLowp(float* dst, const float* src, size_t dataSize);
 void MNNSiLu(float* dst, const float* src, size_t dataSize);
 void MNNSiLuLowp(float* dst, const float* src, size_t dataSize);
+void MNNSnake(float* dst, const float* src, size_t dataSize);
 void MNNReluWithSlopeCommon(float* dst, const float* src, size_t size, float slope);
 void MNNHardSwishCommon(float* dst, const float* src, size_t size);
 void MNNGeluCommon(float* dst, const float* src, size_t size);
