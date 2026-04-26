@@ -1189,6 +1189,9 @@ bool Talker::load() {
     }
 #ifdef ENABLE_PERF_LOGGING
     perf_open();
+    size_t rss_after_load = getCurrentRSS();
+    PERF_PRINT("stage=memory phase=baseline_after_load rss_kb=%zu", rss_after_load);
+    PERF_PRINT("stage=memory phase=no_pipeline_clone delta_kb=0");
 #endif
     return true;
 }
