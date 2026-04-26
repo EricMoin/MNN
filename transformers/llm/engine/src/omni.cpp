@@ -17,7 +17,7 @@
 #include "omni.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
-#include "tokenizer.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #ifdef LLM_SUPPORT_HTTP_RESOURCE
@@ -123,7 +123,9 @@ Omni::Omni(std::shared_ptr<LlmConfig> config) : Llm(config) {
         mVisionMaxSize = config->config_.value("image_max_size", mVisionMaxSize);
         mVisionGlobal = config->config_.value("global_image", mVisionGlobal);
     }
-    if (config->is_audio()) {}
+    if (config->is_audio()) {
+        mAudioPad = config->config_.value("audio_pad", mAudioPad);
+    }
 }
 
 bool Omni::load() {
@@ -133,7 +135,7 @@ bool Omni::load() {
         return false;
     }
     ScheduleConfig config;
-    if (mConfig->mllm_config_.empty()) {
+    if (mConfig->mllm_config_.is_null()) {
         mProcessorRuntimeManager = mRuntimeManager;
     } else {
         BackendConfig cpuBackendConfig;
@@ -192,6 +194,7 @@ bool Omni::load() {
             return false;
         }
     }
+    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
 }
 
@@ -411,14 +414,21 @@ std::vector<int> Omni::qwen2VisionProcess(VARP image) {
 
 std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
     MNN::Express::ExecutorScope s(mExecutor);
-    // SmolVLM
-    constexpr int visionLen = 64;
+    // SmolVLM / LFM2-VL: compute visionLen from global image forward
     bool splitImage = mVisionHeight > mVisionSizeUnit || mVisionWidth > mVisionSizeUnit;
     auto globalImage = MNN::CV::resize(image, {mVisionSizeUnit, mVisionSizeUnit}, 0, 0,
                                        MNN::CV::INTER_LINEAR, MNN::CV::COLOR_BGR2RGB,
                                        mVisionMean, mVisionNorm);
     globalImage = Express::_Unsqueeze(globalImage, {0});
     globalImage = Express::_Convert(globalImage, NCHW);
+    // Forward global image first to determine visionLen dynamically
+    auto globalEmbedding = mVisionModule->forward(globalImage);
+    auto globalDims = globalEmbedding->getInfo()->dim;
+    // globalEmbedding shape: (1, visionLen, 1, hidden) or (visionLen, 1, hidden)
+    int visionLen = (globalDims.size() >= 3) ? globalDims[globalDims.size() - 3] : globalDims[0];
+    if (globalDims.size() >= 4) {
+        visionLen = globalDims[1];
+    }
     std::vector<int> imgIds;
     if (splitImage) {
         mVisionHeight = round(mVisionHeight / (float)mVisionSizeUnit) * mVisionSizeUnit;
@@ -454,13 +464,14 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
             mVisionSizeUnit,
             mVisionSizeUnit
         });
-        patches = _Concat({patches, globalImage}, 0);
         auto imageEmbedding = mVisionModule->forward(patches);
         auto embeddingDims = imageEmbedding->getInfo()->dim;
         for (int i = 0; i < embeddingDims[0]; i++) {
             auto embedding = _Squeeze(_GatherV2(imageEmbedding, _var<int>({i}, {1}), _var<int>({0}, {1})), {0});
             mVisionEmbeddings.push_back(embedding);
         }
+        // Add global image embedding (already computed)
+        mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
         int endRow = tokenizer_encode("\n")[0];
         for (int h = 0; h < grid_h; h++) {
             for (int w = 0; w < grid_w; w++) {
@@ -476,8 +487,7 @@ std::vector<int> Omni::smolvlmVisionProcess(VARP image) {
         }
         imgIds.push_back(endRow);
     } else {
-        auto imageEmbedding = mVisionModule->forward(globalImage);
-        mVisionEmbeddings.push_back(_Squeeze(imageEmbedding, {0}));
+        mVisionEmbeddings.push_back(_Squeeze(globalEmbedding, {0}));
     }
     // global image ids
     imgIds.push_back(mVisionStart);
@@ -748,7 +758,17 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
 
     Timer _t;
-    auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
+    VARP input_features;
+    auto audio_type = mConfig->audio_type();
+    if (audio_type == "conformer") {
+        input_features = MNN::AUDIO::conformer_fbank(waveform);
+    } else {
+        input_features = MNN::AUDIO::whisper_fbank(waveform);
+    }
+    if (input_features == nullptr || input_features->getInfo() == nullptr) {
+        MNN_PRINT("Omni audio fbank failed\n");
+        return std::vector<int>(0);
+    }
     VARP audio_embedding;
     if (mAudioModule->getInfo()->inputNames.size() > 1) {
         int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
@@ -778,8 +798,8 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         }
         audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
     } else {
-        // Qwen2-Audio just support audio time <= 30s
-        if (input_features->getInfo()->dim[2] > 3000) {
+        if (audio_type != "conformer" && input_features->getInfo()->dim[2] > 3000) {
+            // Qwen2-Audio just support audio time <= 30s
             input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
         }
         audio_embedding = mAudioModule->forward(input_features);
@@ -992,6 +1012,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mAudioPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if(txt_embedding == nullptr) {
+                return nullptr;
+            }
             auto mul_embedding = mAudioEmbeddings[audio_idx++];
             embeddings.push_back(txt_embedding);
             embeddings.push_back(mul_embedding);
@@ -1007,6 +1030,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
             }
         } else if (id == mVisionPad) {
             auto txt_embedding = Llm::embedding(cur_txt_ids);
+            if(txt_embedding == nullptr) {
+                return nullptr;
+            }
             if (hasDeepStack) {
                 deepstacksTxt();
                 auto deepstack_embedding = mDeepStackEmbeddings[vision_idx];
@@ -1024,6 +1050,9 @@ VARP Omni::embedding(const std::vector<int>& input_ids) {
     mDeepStackEmbeddings.clear();
     if (!cur_txt_ids.empty()) {
         auto txt_embedding = Llm::embedding(cur_txt_ids);
+        if(txt_embedding == nullptr) {
+            return nullptr;
+        }
         embeddings.push_back(txt_embedding);
         deepstacksTxt();
     }
@@ -1103,6 +1132,7 @@ void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const c
     if (mTalker) {
         mTalker->generate_init();
     }
+    CHECK_LLM_RUNNING(mContext);
     generate(input_ids, max_new_tokens);
 }
 
@@ -1200,6 +1230,7 @@ bool Talker::load() {
         startAsyncWorker();
     }
     
+    mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     return true;
 }
 
@@ -1725,6 +1756,7 @@ int Talker::sample(Express::VARP logits, int offset, int size) {
 }
 
 void Talker::generate() {
+    CHECK_LLM_RUNNING(mContext);
     MNN::Express::ExecutorScope s(mExecutor);
     if (!doGenerate()) { return; }
 #ifdef ENABLE_PERF_LOGGING
