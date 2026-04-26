@@ -1883,6 +1883,8 @@ void Talker::generate() {
 #endif
     if (mAsyncToken2Wav) {
         trySubmitChunkAsync(true);
+        // Release LLM runtime (OpenCL) to free GPU resources for CPU DiT+Vocoder
+        mRuntimeManager.reset();
         std::unique_lock<std::mutex> lock(mWavQueueMutex);
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         while (!mWavLastDone.load()) {
