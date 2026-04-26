@@ -34,6 +34,9 @@
 #include <unistd.h>
 #include <cstdarg>
 #include <mutex>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 static FILE* gPerfLogFile = nullptr;
 static std::mutex gPerfLogMutex;
@@ -66,6 +69,14 @@ static void perf_close() {
 
 static size_t getCurrentRSS() {
     size_t rss = 0;
+#if defined(__APPLE__)
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS) {
+        rss = info.resident_size / 1024;  // bytes -> KB
+    }
+#else
     FILE* fp = fopen("/proc/self/statm", "r");
     if (fp) {
         long page_size = sysconf(_SC_PAGESIZE);
@@ -75,6 +86,7 @@ static size_t getCurrentRSS() {
         }
         fclose(fp);
     }
+#endif
     return rss;
 }
 
