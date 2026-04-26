@@ -131,6 +131,9 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
         sample_time += context->sample_us;
     }
     llm->generateWavform();
+#ifdef LLM_SUPPORT_AUDIO
+    llm->setWavformCallback(nullptr);
+#endif
 
     float vision_s = context->vision_us / 1e6;
     float audio_s = context->audio_us / 1e6;

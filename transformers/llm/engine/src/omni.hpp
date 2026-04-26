@@ -132,6 +132,11 @@ class Omni : public Llm {
 public:
     Omni(std::shared_ptr<LlmConfig> config);
     ~Omni() {
+        mTalker.reset();
+        mExtraArgs.clear();
+        mVisionEmbeddings.clear();
+        mAudioEmbeddings.clear();
+        mDeepStackEmbeddings.clear();
         mVisionModule.reset();
         mAudioModule.reset();
     }

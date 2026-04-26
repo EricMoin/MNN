@@ -1248,6 +1248,24 @@ Talker::~Talker() {
     if (mWavWorkerRunning) {
         stopAsyncWorker();
     }
+    mWavformCallback = nullptr;
+    mPreDit_async.reset();
+    mDit_async.reset();
+    mBigvgan_async.reset();
+    mSpk_async = nullptr;
+    mCond_async = nullptr;
+    mTextBos = nullptr;
+    mTextEos = nullptr;
+    mTextPad = nullptr;
+    mCodecBos = nullptr;
+    mCodecPad = nullptr;
+    mSpk = nullptr;
+    mCond = nullptr;
+    mTalkerEmbeds.clear();
+    mMelBuffer = nullptr;
+    mPreDit.reset();
+    mDit.reset();
+    mBigvgan.reset();
 }
 
 void Talker::generate_init(std::ostream* os, const char* end_with) {
@@ -1551,6 +1569,7 @@ void Talker::asyncWorkerLoop() {
     mBigvgan_async.reset();
     mSpk_async = nullptr;
     mCond_async = nullptr;
+    mMelBuffer = nullptr;
 }
 
 VARP Talker::ditForwardAsync(const int codec_size, const int* codec_tokens, const float* initial_noise) {

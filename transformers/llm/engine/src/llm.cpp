@@ -1033,6 +1033,16 @@ Llm::~Llm() {
     }
 #endif
     mGenerateParam.reset();
+    // Clear VARPs and modules before destroying executor, since their
+    // destructors may reference backend resources owned by the executor.
+    inputsEmbeds = nullptr;
+    attentionMask = nullptr;
+    positionIds = nullptr;
+    logitsAllIdx = nullptr;
+    logitsLastIdx = nullptr;
+    mAttentionMaskVarVec.clear();
+    mPositionIdsVarVec.clear();
+    mModulePool.clear();
     mModule.reset();
     mRuntimeManager.reset();
     mProcessorRuntimeManager.reset();
