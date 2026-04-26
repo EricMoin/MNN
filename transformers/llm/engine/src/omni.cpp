@@ -1636,6 +1636,7 @@ void Talker::vocoderWorkerLoop() {
     }
 
     mBigvgan_async.reset();
+    mMelBuffer = nullptr;
 }
 
 VARP Talker::ditForwardAsync(const int codec_size, const int* codec_tokens, const float* initial_noise) {
