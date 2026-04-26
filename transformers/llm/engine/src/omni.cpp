@@ -1227,6 +1227,10 @@ bool Talker::load() {
     }
 #endif
     if (mAsyncToken2Wav && doGenerate()) {
+#ifdef ENABLE_PERF_LOGGING
+        size_t rss_before_pipeline = getCurrentRSS();
+        PERF_PRINT("stage=memory phase=baseline_before_pipeline rss_kb=%zu", rss_before_pipeline);
+#endif
         startAsyncWorker();
     }
     
@@ -1515,10 +1519,16 @@ void Talker::asyncWorkerLoop() {
     BackendConfig backendConfig;
     auto forwardType = backend_type_convert(mConfig->backend_type(true));
     int numThread = mConfig->thread_num(true);
+#ifdef ENABLE_PERF_LOGGING
+    size_t rss_before_executor = getCurrentRSS();
+#endif
     auto executor = Express::Executor::newExecutor(forwardType, backendConfig, numThread);
     Express::ExecutorScope scope(executor);
 #ifdef ENABLE_PERF_LOGGING
-    size_t rss_before = getCurrentRSS();
+    size_t rss_after_executor = getCurrentRSS();
+    PERF_PRINT("stage=memory phase=v2_executor rss_kb_before=%zu rss_kb_after=%zu delta_kb=%zd",
+               rss_before_executor, rss_after_executor, (ptrdiff_t)(rss_after_executor - rss_before_executor));
+    size_t rss_before_clone = getCurrentRSS();
 #endif
     mPreDit_async.reset(Module::clone(mPreDit.get()));
     mDit_async.reset(Module::clone(mDit.get()));
@@ -1526,9 +1536,11 @@ void Talker::asyncWorkerLoop() {
     mSpk_async = _Clone(mSpk, true);
     mCond_async = _Clone(mCond, true);
 #ifdef ENABLE_PERF_LOGGING
-    size_t rss_after = getCurrentRSS();
-    PERF_PRINT("stage=memory phase=clone_dit rss_kb_before=%zu rss_kb_after=%zu delta_kb=%zd",
-               rss_before, rss_after, (ptrdiff_t)(rss_after - rss_before));
+    size_t rss_after_clone = getCurrentRSS();
+    PERF_PRINT("stage=memory phase=clone_all rss_kb_before=%zu rss_kb_after=%zu delta_kb=%zd",
+               rss_before_clone, rss_after_clone, (ptrdiff_t)(rss_after_clone - rss_before_clone));
+    PERF_PRINT("stage=memory phase=v2_worker_total rss_kb_before=%zu rss_kb_after=%zu delta_kb=%zd",
+               rss_before_executor, rss_after_clone, (ptrdiff_t)(rss_after_clone - rss_before_executor));
 #endif
 
     while (true) {
