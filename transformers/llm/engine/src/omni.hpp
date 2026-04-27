@@ -178,6 +178,7 @@ private:
     // m_rope position ids
     void addPositionIds(int t, int h = -1, int w = -1);
     MropeInfo mPositionIds;
+    int64_t mThinkerElapsedUs = 0;
 };
 
 }
