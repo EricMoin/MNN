@@ -1114,7 +1114,9 @@ void Omni::response(const std::vector<int>& input_ids, std::ostream* os, const c
     if (mTalker) {
         mTalker->generate_init();
     }
+    MNN::Timer thinker_timer;
     generate(input_ids, max_new_tokens);
+    mThinkerElapsedUs = thinker_timer.durationInUs();
 }
 
 void Omni::setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) {
@@ -1130,6 +1132,7 @@ void Omni::generateWavform() {
         auto context = mTalker->getContext();
         float prefill_s = context->prefill_us / 1e6;
         float decode_s = context->decode_us / 1e6;
+        float ttfa_s = (mThinkerElapsedUs + context->ttfa_us) / 1e6;
         float token2wav_s = context->audio_us / 1e6;
         float dit_s = context->vision_us / 1e6;
         float tts_s = token2wav_s;
@@ -1142,6 +1145,7 @@ void Omni::generateWavform() {
         printf("decode tokens num = %d\n", context->gen_seq_len);
         printf("  prefill time = %.2f s\n", prefill_s);
         printf("   decode time = %.2f s\n", decode_s);
+        printf("      ttfa time = %.2f s\n", ttfa_s);
         printf("      dit time = %.2f s\n", dit_s);
         printf("token2wav time = %.2f s\n", token2wav_s);
         printf("      tts time = %.2f s\n", tts_s);
