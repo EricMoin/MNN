@@ -28,7 +28,7 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 mkdir -p tmp
-echo "Who are you?" > prompt.txt
+echo "Please explain in detail how the human heart works, including its four chambers, the blood flow cycle, and why it beats." > prompt.txt
 
 # ensure googletest is cached locally (avoid network download every time)
 if [ ! -d "$GOOGLETEST_CACHE" ]; then
@@ -47,7 +47,8 @@ cmake .. -G Ninja \
     -DMNN_BUILD_LLM=ON \
     -DMNN_SUPPORT_TRANSFORMER_FUSE=ON \
     -DMNN_BUILD_AUDIO=ON \
-    -DMNN_OPENCL=ON \
+    -DMNN_AVX512=ON \
+    -DMNN_METAL=ON \
     -DMNN_USE_SSE=ON \
     -DCMAKE_CXX_FLAGS="-DDUMP_TALKER_PERFORMANCE -DENABLE_PERF_LOGGING" \
     ${GOOGLETEST_CACHE:+-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=$GOOGLETEST_CACHE}
