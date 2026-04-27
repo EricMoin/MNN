@@ -1344,13 +1344,11 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
     updateContext(seqLen, 0);
     mContext->prefill_us += _t.durationInUs();
 
-    // Sample first thinker token from prefill logits
     mContext->current_token = sample(outputs[0]);
     mContext->history_tokens.push_back(mContext->current_token);
     mContext->output_tokens.push_back(mContext->current_token);
     updateContext(0, 1);
 
-    // Output first token
     if (!is_stop(mContext->current_token)) {
         auto decodeStr = tokenizer_decode(mContext->current_token);
         mContext->generate_str += decodeStr;
@@ -1359,10 +1357,7 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
         }
     }
 
-    // ---- 1.5 Run one Thinker decode step to populate mTalkerEmbeds[1] ----
-    // This is needed so stepPrefill() has the thinker's first decode hidden state
-    // (mTalkerEmbeds[1]) instead of mTextEos.
-    // Only run if the first token is NOT a stop token.
+    // ---- 1.5 Run one Thinker decode step to produce mTalkerEmbeds[1] ----
     int thinker_tokens = 1;
     if (!is_stop(mContext->current_token)) {
         MNN::Timer t_decode;
@@ -1390,87 +1385,67 @@ void Omni::responseInterleaved(const std::vector<int>& input_ids, std::ostream* 
         }
     }
 
-    // ---- 2. Talker Prefill ----
-    // Now mTalkerEmbeds has at least 2 thinker embed entries (from prefill + decode)
+    // ---- 2. Launch Talker decode thread ----
     if (!mTalker->hasEmbeds()) {
-        MNN_ERROR("Talker embeds empty before prefill in interleaved mode\n");
+        MNN_ERROR("Talker embeds empty before launching talker thread\n");
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return;
     }
-    mTalker->stepPrefill();
+    mTalker->startTalkerDecode();
     mContext->ttfa_us = ttfa_timer.durationInUs();
 
-    // ---- 3. Interleaved Decode Loop ----
+    // ---- 3. Thinker full-speed decode (main thread, Metal GPU) ----
     bool thinker_done = is_stop(mContext->current_token);
-    bool talker_done = !mTalker->doGenerate();
-    int talker_step = 2;
-    int64_t talker_decode_us = 0;
 
-    while (!thinker_done || !talker_done) {
+    while (!thinker_done) {
         if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
             break;
         }
 
-        // ---- Thinker Decode Step ----
-        if (!thinker_done && thinker_tokens < max_new_tokens) {
-            MNN::Timer t_decode;
-            auto decode_outputs = forwardVec({mContext->current_token});
-            if (decode_outputs.empty()) {
-                break;
-            }
-            updateContext(1, 0);
-
-            int next_token = sample(decode_outputs[0]);
-            mContext->current_token = next_token;
-            mContext->history_tokens.push_back(next_token);
-            mContext->output_tokens.push_back(next_token);
-            updateContext(0, 1);
-            mContext->decode_us += t_decode.durationInUs();
-            thinker_tokens++;
-
-            if (is_stop(next_token)) {
-                thinker_done = true;
-                if (nullptr != os) {
-                    *os << end_with << std::flush;
-                }
-            } else {
-                auto decodeStr = tokenizer_decode(next_token);
-                mContext->generate_str += decodeStr;
-                if (nullptr != os) {
-                    *os << decodeStr << std::flush;
-                }
-            }
-        } else if (!thinker_done) {
+        if (thinker_tokens >= max_new_tokens) {
             thinker_done = true;
             if (nullptr != os) {
                 *os << end_with << std::flush;
             }
+            break;
         }
 
-        // ---- Talker Decode Step ----
-        if (!talker_done) {
-            if (talker_step >= mTalker->maxNewTokens()) {
-                talker_done = true;
-            } else {
-                MNN::Timer t_talker;
-                mTalker->stepForward(talker_step++);
-                talker_decode_us += t_talker.durationInUs();
+        MNN::Timer t_decode;
+        auto decode_outputs = forwardVec({mContext->current_token});
+        if (decode_outputs.empty()) {
+            break;
+        }
+        updateContext(1, 0);
 
-                int talker_token = mTalker->getContext()->current_token;
-                if (talker_token == 8292 || talker_token == 8294) {
-                    talker_done = true;
-                }
+        int next_token = sample(decode_outputs[0]);
+        mContext->current_token = next_token;
+        mContext->history_tokens.push_back(next_token);
+        mContext->output_tokens.push_back(next_token);
+        updateContext(0, 1);
+        mContext->decode_us += t_decode.durationInUs();
+        thinker_tokens++;
+
+        if (is_stop(next_token)) {
+            thinker_done = true;
+            if (nullptr != os) {
+                *os << end_with << std::flush;
+            }
+        } else {
+            auto decodeStr = tokenizer_decode(next_token);
+            mContext->generate_str += decodeStr;
+            if (nullptr != os) {
+                *os << decodeStr << std::flush;
             }
         }
     }
 
-    // Accumulate talker decode time collected during interleaved loop
-    mTalker->mContext->decode_us += talker_decode_us;
+    // ---- 4. Signal Thinker done, wait for Talker thread ----
+    mTalker->notifyThinkerDone();
 
 #ifdef ENABLE_PERF_LOGGING
     auto t_flush_start = std::chrono::high_resolution_clock::now();
 #endif
-    mTalker->finalize();
+    mTalker->waitTalkerDecode();
 #ifdef ENABLE_PERF_LOGGING
     auto t_flush_end = std::chrono::high_resolution_clock::now();
     double flush_time_ms = std::chrono::duration<double, std::milli>(t_flush_end - t_flush_start).count();
@@ -1673,6 +1648,8 @@ void Talker::generate_init(std::ostream* os, const char* end_with) {
     dit_left_padding = 0;
     vocoder_left_pad = 0;
     mWavLastDone.store(false);
+    mThinkerDone.store(false);
+    mTalkerDecodeDone.store(false);
     {
         std::lock_guard<std::mutex> lock(mWavQueueMutex);
         std::queue<WavChunk>().swap(mWavQueue);
@@ -1943,6 +1920,7 @@ void Talker::ditWorkerLoop() {
             chunk = std::move(mWavQueue.front());
             mWavQueue.pop();
         }
+        mWavQueueCond.notify_one();
 #ifdef ENABLE_PERF_LOGGING
         int chunk_id = gPerfChunkId.fetch_add(1);
         PERF_PRINT("stage=v2 thread=dit phase=dequeued_token_q chunk_id=%d token_queue_depth=%zu",
@@ -2364,7 +2342,109 @@ void Talker::setPostionIds(const MropeInfo& positionIds) {
 
 void Talker::addTalkerEmbeds(VARP talker_embeds) {
     if (!doGenerate()) { return; }
-    mTalkerEmbeds.push_back(_Clone(talker_embeds, true));
+    auto cloned = _Clone(talker_embeds, true);
+    {
+        std::lock_guard<std::mutex> lock(mEmbedMutex);
+        mTalkerEmbeds.push_back(cloned);
+    }
+    mEmbedCond.notify_one();
+}
+
+void Talker::startTalkerDecode() {
+    mThinkerDone.store(false);
+    mTalkerDecodeDone.store(false);
+    mTalkerDecodeThread = std::thread(&Talker::talkerDecodeLoop, this);
+}
+
+void Talker::waitTalkerDecode() {
+    if (mTalkerDecodeThread.joinable()) {
+        mTalkerDecodeThread.join();
+    }
+}
+
+void Talker::notifyThinkerDone() {
+    mThinkerDone.store(true);
+    mEmbedCond.notify_all();
+}
+
+void Talker::talkerDecodeLoop() {
+    MNN::Express::ExecutorScope s(mExecutor);
+    if (!doGenerate()) {
+        mTalkerDecodeDone.store(true);
+        return;
+    }
+
+    VARP embed0, embed1;
+    {
+        std::unique_lock<std::mutex> lock(mEmbedMutex);
+        mEmbedCond.wait(lock, [this] { return mTalkerEmbeds.size() >= 2 || mThinkerDone.load(); });
+        if (mTalkerEmbeds.size() < 2) {
+            mTalkerDecodeDone.store(true);
+            return;
+        }
+        embed0 = mTalkerEmbeds[0];
+        embed1 = mTalkerEmbeds[1];
+        mTalkerEmbeds.push_back(mTextEos);
+    }
+    auto prefill_embeds = _Concat({embed0, mTextBos + mCodecPad, embed1 + mCodecBos}, 1);
+    mPositionIds.push_back();
+    mPositionIds.push_back();
+    mContext->prompt_len = prefill_embeds->getInfo()->dim[1];
+    MNN::Timer _t_prefill;
+    auto logits = forward(prefill_embeds);
+    mContext->current_token = sample(logits);
+    mContext->history_tokens.push_back(mContext->current_token);
+    mContext->output_tokens.push_back(mContext->current_token);
+    mContext->prefill_us += _t_prefill.durationInUs();
+
+    if (mAsyncToken2Wav && !mWavWorkerRunning) {
+        startAsyncWorker();
+    }
+
+    MNN::Timer _t_decode;
+    for (int i = 1; i < mMaxNewTokens; i++) {
+        {
+            std::unique_lock<std::mutex> lock(mEmbedMutex);
+            if (i + 1 < (int)mTalkerEmbeds.size()) {
+                auto input_embeds = embedding({mContext->current_token});
+                input_embeds = input_embeds + mTalkerEmbeds[i + 1];
+                lock.unlock();
+                auto logits = forward(input_embeds);
+                int token = sample(logits);
+                mContext->current_token = token;
+            } else {
+                bool thinker_finished = mThinkerDone.load();
+                lock.unlock();
+                auto input_embeds = embedding({mContext->current_token});
+                if (!thinker_finished) {
+                    std::unique_lock<std::mutex> lock2(mEmbedMutex);
+                    mEmbedCond.wait_for(lock2, std::chrono::milliseconds(1),
+                        [&] { return i + 1 < (int)mTalkerEmbeds.size() || mThinkerDone.load(); });
+                    if (i + 1 < (int)mTalkerEmbeds.size()) {
+                        input_embeds = input_embeds + mTalkerEmbeds[i + 1];
+                    } else {
+                        input_embeds = input_embeds + mTextPad;
+                    }
+                } else {
+                    input_embeds = input_embeds + mTextPad;
+                }
+                auto logits = forward(input_embeds);
+                int token = sample(logits);
+                mContext->current_token = token;
+            }
+        }
+
+        mContext->history_tokens.push_back(mContext->current_token);
+        mContext->output_tokens.push_back(mContext->current_token);
+
+        if (mContext->current_token == 8292 || mContext->current_token == 8294) {
+            break;
+        }
+    }
+    mContext->decode_us += _t_decode.durationInUs();
+
+    finalize();
+    mTalkerDecodeDone.store(true);
 }
 
 } // namespace Transformer

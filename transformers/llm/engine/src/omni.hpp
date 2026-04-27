@@ -93,14 +93,16 @@ public:
     void setPostionIds(const MropeInfo& positionIds);
     void addTalkerEmbeds(VARP talker_embeds);
     bool hasEmbeds() const { return !mTalkerEmbeds.empty(); }
-    // is generate
+    void startTalkerDecode();
+    void waitTalkerDecode();
+    void notifyThinkerDone();
     bool doGenerate() { return mWavformCallback != nullptr; }
     int maxNewTokens() const { return mMaxNewTokens; }
-    // is decode with token2wav
     bool mStreamWithDecode = false;
     bool mInterleaved = false;
 
 private:
+    void talkerDecodeLoop();
     int mMaxNewTokens = 2048, mTextBosToken = 151872, mTextEosToken = 151861,
         mTextPadToken = 151859, mCodecBosToken = 8293, mCodecPadToken = 8292;
     VARP mTextBos, mTextEos, mTextPad, mCodecBos, mCodecPad, mSpk, mCond;
@@ -141,6 +143,11 @@ private:
     // cloned modules for worker thread — independent Session/Runtime, shared weights
     std::shared_ptr<Module> mPreDit_async, mDit_async, mBigvgan_async;
     VARP mSpk_async, mCond_async;
+    std::thread mTalkerDecodeThread;
+    std::mutex mEmbedMutex;
+    std::condition_variable mEmbedCond;
+    std::atomic<bool> mThinkerDone{false};
+    std::atomic<bool> mTalkerDecodeDone{false};
 };
 
 class Omni : public Llm {
