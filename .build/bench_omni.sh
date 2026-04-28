@@ -60,10 +60,12 @@ echo "--- Build OK ---"
 echo "--- Running 10 benchmarks ---"
 mkdir -p "$RESULTS_DIR"
 rm -f "$RESULTS_DIR"/perf_log_run_*.txt
+rm -f "$RESULTS_DIR"/stdout_run_*.txt
 
 for i in $(seq 1 10); do
     printf "  Run %2d/10 ... " "$i"
-    if ./llm_demo "$MODEL_DIR/${CONFIG_NAME}.json" prompt.txt > /dev/null 2>&1; then
+    STDOUT_FILE="$RESULTS_DIR/stdout_run_${i}.txt"
+    if ./llm_demo "$MODEL_DIR/${CONFIG_NAME}.json" prompt.txt > "$STDOUT_FILE" 2>&1; then
         mv perf_log.txt "$RESULTS_DIR/perf_log_run_${i}.txt"
         echo "done"
     else
@@ -95,11 +97,26 @@ done
 # --- 5. compute averages ---
 echo "--- Computing averages ---"
 python3 -c "
-import json, glob, statistics
+import json, glob, re, statistics
 d = '$RESULTS_DIR'
+
+# --- parse ttfa from DUMP_TALKER_PERFORMANCE in stdout files ---
+ttfa_values = []
+for sf in sorted(glob.glob(f'{d}/stdout_run_*.txt')):
+    with open(sf) as fp:
+        text = fp.read()
+    # interleaved mode: 'ttfa (total) = 1.23 s'
+    m = re.search(r'ttfa \(total\)\s*=\s*([\d.]+)\s*s', text)
+    if not m:
+        # serial mode: 'ttfa time = 1.23 s'
+        m = re.search(r'ttfa time\s*=\s*([\d.]+)\s*s', text)
+    if m:
+        ttfa_values.append(float(m.group(1)))
+
+# --- parse perf_log JSON files ---
 files = sorted(glob.glob(f'{d}/perf_run_*.json'))
-if not files:
-    print('No JSON files found, skipping average.')
+if not files and not ttfa_values:
+    print('No JSON files or ttfa data found, skipping average.')
     exit(0)
 summaries = []
 for f in files:
@@ -135,16 +152,29 @@ else:
         'avg_dit_ms':     {'mean': statistics.mean(dit), 'stddev': statistics.stdev(dit) if len(dit)>1 else 0, 'min': min(dit), 'max': max(dit)},
         'avg_vocoder_ms': {'mean': statistics.mean(voc), 'stddev': statistics.stdev(voc) if len(voc)>1 else 0, 'min': min(voc), 'max': max(voc)},
     }
+
+# --- merge ttfa into averages ---
+if ttfa_values:
+    avg['ttfa_s'] = {
+        'mean': statistics.mean(ttfa_values),
+        'stddev': statistics.stdev(ttfa_values) if len(ttfa_values) > 1 else 0,
+        'min': min(ttfa_values),
+        'max': max(ttfa_values),
+        'samples': len(ttfa_values),
+    }
+
 with open(f'{d}/perf_avg.json','w') as fp: json.dump(avg, fp, indent=2)
 with open(f'{d}/perf_avg_summary.txt','w') as fp:
-    fp.write(f'$BRANCH Branch - {len(files)}-Run Average\\n')
+    fp.write(f'$BRANCH Branch - {max(len(files), len(ttfa_values))}-Run Average\\n')
     fp.write('=' * 50 + '\\n')
     for k,v in avg.items():
         if isinstance(v, dict) and 'mean' in v:
             fp.write(f'{k}: mean={v[\"mean\"]:.3f} stddev={v.get(\"stddev\",0):.3f}\\n')
-print(f'  avg_dit={avg.get(\"avg_dit_ms\",{}).get(\"mean\",\"N/A\")}  avg_voc={avg.get(\"avg_vocoder_ms\",{}).get(\"mean\",\"N/A\")}')
+ttfa_info = avg.get('ttfa_s',{})
+print(f'  avg_dit={avg.get(\"avg_dit_ms\",{}).get(\"mean\",\"N/A\")}  avg_voc={avg.get(\"avg_vocoder_ms\",{}).get(\"mean\",\"N/A\")}  avg_ttfa={ttfa_info.get(\"mean\",\"N/A\")}s')
 "
 
 echo "=== Done: results in $RESULTS_DIR ==="
 ls -la "$RESULTS_DIR"/perf_log_run_*.txt | wc -l | xargs echo "  Log files:"
+ls -la "$RESULTS_DIR"/stdout_run_*.txt 2>/dev/null | wc -l | xargs echo "  Stdout files:"
 ls -la "$RESULTS_DIR"/perf_avg.json 2>/dev/null && echo "  Averages: OK" || echo "  Averages: MISSING"
